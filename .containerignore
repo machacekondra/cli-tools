@@ -1,0 +1,10 @@
+# Keep the build context small and deterministic. .git in particular must not
+# reach the builder: Go would try to stamp VCS metadata from it, and its
+# ownership inside the container does not match the build user.
+.git
+.github
+bin/
+dist/
+coverage.out
+*.test
+README.md
