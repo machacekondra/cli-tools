@@ -14,6 +14,10 @@ type Project struct {
 	Root string // repository root, all Pom.Path values are relative to it
 	Poms []*Pom
 
+	// realRoot is Root with symlinks resolved, used to prove that every file
+	// read or written stays inside the checkout.
+	realRoot string
+
 	byPath  map[string]*Pom
 	byCoord map[string]*Pom
 }
@@ -25,12 +29,18 @@ type Project struct {
 // from a remote repository, but a version declared there is not ours to
 // change, and writing a file we never read is worse than refusing.
 func Load(root string) (*Project, error) {
-	p := &Project{
-		Root:    root,
-		byPath:  map[string]*Pom{},
-		byCoord: map[string]*Pom{},
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return nil, fmt.Errorf("resolving repository root %s: %w", root, err)
 	}
-	if err := p.load("pom.xml"); err != nil {
+
+	p := &Project{
+		Root:     root,
+		realRoot: realRoot,
+		byPath:   map[string]*Pom{},
+		byCoord:  map[string]*Pom{},
+	}
+	if err := p.load("pom.xml", loadRoot, nil); err != nil {
 		return nil, err
 	}
 	if len(p.Poms) == 0 {
@@ -41,18 +51,40 @@ func Load(root string) (*Project, error) {
 	return p, nil
 }
 
-func (p *Project) load(rel string) error {
+// loadKind says how a POM was reached, which decides what has to be true
+// before it is admitted to the project.
+type loadKind int
+
+const (
+	loadRoot loadKind = iota
+	loadModule
+	loadParent
+)
+
+func (p *Project) load(rel string, kind loadKind, from *Pom) error {
 	rel = filepath.ToSlash(filepath.Clean(rel))
 	if _, seen := p.byPath[rel]; seen {
 		return nil
 	}
-	// A module or relativePath may point outside the checkout. Refuse rather
-	// than reading arbitrary files from the build host.
+	// A module or relativePath may point outside the checkout.
 	if rel == ".." || strings.HasPrefix(rel, "../") {
 		return nil
 	}
 
 	abs := filepath.Join(p.Root, filepath.FromSlash(rel))
+
+	// The lexical check above is not enough: a module directory can be a
+	// symlink pointing outside the repository, and ReadFile/WriteFile follow
+	// it. Resolve the real path and require it to stay under the real root,
+	// so an edit can never escape the checkout.
+	contained, err := withinRoot(p.realRoot, abs)
+	if err != nil {
+		return err
+	}
+	if !contained {
+		return nil
+	}
+
 	content, err := os.ReadFile(abs)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -65,22 +97,86 @@ func (p *Project) load(rel string) error {
 	if err != nil {
 		return err
 	}
+
+	// A <relativePath> can point at any POM on disk. If an unrelated project
+	// were admitted here it would be scanned for declarations and its files
+	// rewritten, so the candidate has to prove it really is the parent
+	// before it joins the project -- not afterwards, when it and all of its
+	// own modules are already indexed.
+	if kind == loadParent && !isDeclaredParent(from, pom) {
+		return nil
+	}
+
 	p.byPath[rel] = pom
 	p.byCoord[pom.Coord()] = pom
 	p.Poms = append(p.Poms, pom)
 
 	dir := filepath.Dir(rel)
 	for _, m := range pom.Modules {
-		if err := p.load(modulePath(dir, m)); err != nil {
+		if err := p.load(modulePath(dir, m), loadModule, pom); err != nil {
 			return err
 		}
 	}
 	if parent := parentPath(dir, pom.Parent); parent != "" {
-		if err := p.load(parent); err != nil {
+		if err := p.load(parent, loadParent, pom); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// isDeclaredParent reports whether candidate is the parent that child
+// declares. Maven matches on all three coordinates; checking only
+// groupId:artifactId would accept a local copy at a different version, whose
+// properties are not the ones the child actually inherits.
+func isDeclaredParent(child, candidate *Pom) bool {
+	if child == nil || child.Parent == nil {
+		return false
+	}
+	ref := child.Parent
+	if candidate.Coord() != ref.GroupID+":"+ref.ArtifactID {
+		return false
+	}
+	// An absent version on either side cannot be compared; the coordinate
+	// match is then the strongest evidence available.
+	if ref.Version == "" || candidate.Version == "" {
+		return true
+	}
+	return ref.Version == candidate.Version
+}
+
+// withinRoot reports whether path, with every symlink resolved, is inside
+// root. Missing paths are resolved via their nearest existing ancestor so a
+// declared-but-absent module is simply skipped rather than erroring.
+func withinRoot(root, path string) (bool, error) {
+	resolved, err := resolveExisting(path)
+	if err != nil {
+		return false, err
+	}
+	rel, err := filepath.Rel(root, resolved)
+	if err != nil {
+		return false, nil
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)), nil
+}
+
+func resolveExisting(path string) (string, error) {
+	remainder := ""
+	for cur := path; ; {
+		got, err := filepath.EvalSymlinks(cur)
+		if err == nil {
+			return filepath.Join(got, remainder), nil
+		}
+		if !os.IsNotExist(err) {
+			return "", fmt.Errorf("resolving %s: %w", path, err)
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return path, nil
+		}
+		remainder = filepath.Join(filepath.Base(cur), remainder)
+		cur = parent
+	}
 }
 
 // modulePath resolves a <module> entry. Maven treats it as a directory
@@ -134,11 +230,7 @@ func (p *Project) ancestors(pom *Pom) []*Pom {
 			return chain
 		}
 		next := p.byPath[path]
-		if next == nil || seen[next.Path] {
-			return chain
-		}
-		want := cur.Parent.GroupID + ":" + cur.Parent.ArtifactID
-		if next.Coord() != want {
+		if next == nil || seen[next.Path] || !isDeclaredParent(cur, next) {
 			return chain
 		}
 		chain = append(chain, next)
@@ -178,28 +270,70 @@ func (p *Project) resolveProperty(pom *Pom, name string) (ResolvedProperty, bool
 	return ResolvedProperty{}, false
 }
 
-// resolveVersion expands a version literal to a concrete version, following
-// property chains. It returns ok=false if the value cannot be fully resolved
-// (an unknown property, or a cycle).
-func (p *Project) resolveVersion(pom *Pom, version string) (string, bool) {
+// resolveChain follows a version literal through any number of property
+// indirections and returns the property that actually holds the concrete
+// value -- the one an edit has to land on.
+//
+// A single hop is not enough: <version>${lib.version}</version> where
+// lib.version is itself ${base.version} must be rewritten at base.version.
+// Editing the first hop would replace an alias with a literal, and comparing
+// a drift check against it would compare against "${base.version}".
+func (p *Project) resolveChain(pom *Pom, version string) (ResolvedProperty, bool) {
 	cur := version
+	var last ResolvedProperty
 	seen := map[string]bool{}
 
-	for range 10 { // depth limit doubles as a cycle guard
+	for range 20 { // depth limit doubles as a cycle guard
 		name, isRef := PropertyRef(cur)
 		if !isRef {
-			return cur, !strings.Contains(cur, "${")
+			// A value that still embeds a placeholder in a larger string has
+			// no single span to rewrite.
+			if strings.Contains(cur, "${") {
+				return ResolvedProperty{}, false
+			}
+			return last, last.Pom != nil
 		}
 		if seen[name] {
-			return "", false
+			return ResolvedProperty{}, false
 		}
 		seen[name] = true
 
 		resolved, ok := p.resolveProperty(pom, name)
 		if !ok {
-			return "", false
+			return ResolvedProperty{}, false
 		}
+		// Each hop may be declared in a different POM; resolve the next hop
+		// from the POM that declared this one, as Maven does.
+		pom = resolved.Pom
+		last = resolved
 		cur = resolved.Value
 	}
-	return "", false
+	return ResolvedProperty{}, false
+}
+
+// resolveVersion expands a version literal to a concrete version. It returns
+// ok=false if the value cannot be fully resolved (an unknown property, a
+// cycle, or a placeholder embedded in a larger string).
+func (p *Project) resolveVersion(pom *Pom, version string) (string, bool) {
+	if _, isRef := PropertyRef(version); !isRef {
+		return version, !strings.Contains(version, "${")
+	}
+	resolved, ok := p.resolveChain(pom, version)
+	if !ok {
+		return "", false
+	}
+	return resolved.Value, true
+}
+
+// InheritanceRoots returns the POMs that have no in-repo parent. Each is the
+// top of a separate inheritance tree, and therefore the only place a
+// dependencyManagement entry can be added that the tree below it inherits.
+func (p *Project) InheritanceRoots() []*Pom {
+	var roots []*Pom
+	for _, pom := range p.Poms {
+		if chain := p.ancestors(pom); len(chain) == 1 {
+			roots = append(roots, pom)
+		}
+	}
+	return roots
 }

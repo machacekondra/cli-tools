@@ -3,6 +3,7 @@ package maven
 import (
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -362,7 +363,7 @@ func TestRefusals(t *testing.T) {
 			name:       "property declared nowhere in the repo",
 			version:    "${from.remote.parent}",
 			req:        jackson("2.15.4"),
-			wantReason: "not declared in this repository",
+			wantReason: "does not resolve to a literal",
 		},
 	}
 
@@ -515,7 +516,7 @@ func TestPinTransitiveCreatesDependencyManagement(t *testing.T) {
 		t.Errorf("generated block not found.\nwant:\n%s\ngot:\n%s", want, got)
 	}
 	// The result must still parse, and must now resolve the artifact.
-	assertReparses(t, got, "com.fasterxml.jackson.core:jackson-databind", "2.15.4")
+	assertReparses(t, got, "com.fasterxml.jackson.core:jackson-databind", "2.15.4", true)
 }
 
 func TestPinTransitiveAppendsToExistingDependencyManagement(t *testing.T) {
@@ -540,7 +541,7 @@ func TestPinTransitiveAppendsToExistingDependencyManagement(t *testing.T) {
 	if !strings.Contains(got, "<artifactId>spring-web</artifactId>") {
 		t.Error("existing entry was lost")
 	}
-	assertReparses(t, got, "com.fasterxml.jackson.core:jackson-databind", "2.15.4")
+	assertReparses(t, got, "com.fasterxml.jackson.core:jackson-databind", "2.15.4", true)
 }
 
 func TestPinUsesTheFilesOwnIndentation(t *testing.T) {
@@ -740,21 +741,376 @@ func TestMultipleEditsInOneFile(t *testing.T) {
 	}
 }
 
+// A property can alias another property. The edit must land on the one
+// holding the literal, and the drift check must compare against that literal
+// rather than against the placeholder text.
+func TestPropertyChainResolvesToTerminalProperty(t *testing.T) {
+	src := pom(`  <properties>
+    <base.version>2.13.0</base.version>
+    <jackson.version>${base.version}</jackson.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+  </dependencies>`)
+
+	req := jackson("2.15.4")
+	req.CurrentVersion = "2.13.0" // must compare against the literal, not "${base.version}"
+	plan, out := run(t, map[string]string{"pom.xml": src}, req)
+
+	if len(plan.Skipped) != 0 {
+		t.Fatalf("drift check compared against the alias: %+v", plan.Skipped)
+	}
+	got := out["pom.xml"]
+	if !strings.Contains(got, "<base.version>2.15.4</base.version>") {
+		t.Errorf("terminal property not bumped:\n%s", got)
+	}
+	if !strings.Contains(got, "<jackson.version>${base.version}</jackson.version>") {
+		t.Errorf("the aliasing property must be left intact:\n%s", got)
+	}
+}
+
+// A range hides behind a property: the literal "${x}" never looks like a
+// range, so the check has to run on the resolved value.
+func TestRangeStoredInPropertyIsRefused(t *testing.T) {
+	src := pom(`  <properties>
+    <jackson.version>[2.13.0,2.14.0)</jackson.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+  </dependencies>`)
+
+	plan, out := run(t, map[string]string{"pom.xml": src}, jackson("2.15.4"))
+
+	if len(out) != 0 {
+		t.Errorf("a range held in a property must not be overwritten:\n%v", out)
+	}
+	if len(plan.Skipped) != 1 || !strings.Contains(plan.Skipped[0].Reason, "range") {
+		t.Errorf("want a range refusal, got %+v", plan.Skipped)
+	}
+}
+
+// encoding/xml decodes CDATA and entities, so the decoded value and the raw
+// bytes differ. Splicing a replacement over the raw span would delete the
+// wrapper or corrupt the entity.
+func TestValuesNeedingDecodingAreRefused(t *testing.T) {
+	tests := map[string]string{
+		"CDATA-wrapped version":      `<version><![CDATA[2.13.0]]></version>`,
+		"version split by a comment": `<version>2.13<!--x-->.0</version>`,
+	}
+
+	for name, decl := range tests {
+		t.Run(name, func(t *testing.T) {
+			src := pom(`  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      ` + decl + `
+    </dependency>
+  </dependencies>`)
+
+			plan, out := run(t, map[string]string{"pom.xml": src}, jackson("2.15.4"))
+
+			if len(out) != 0 {
+				t.Errorf("must not rewrite a value whose raw bytes differ from its decoded form:\n%v", out)
+			}
+			if len(plan.Skipped) != 1 {
+				t.Fatalf("want a refusal explaining why, got %+v", plan.Skipped)
+			}
+		})
+	}
+}
+
+// The same property name declared in two profiles is two declarations with
+// two spans. Editing whichever was indexed last would update one and leave
+// the other on the vulnerable version while reporting success.
+func TestAmbiguousProfilePropertyIsRefused(t *testing.T) {
+	src := pom(`  <profiles>
+    <profile>
+      <id>a</id>
+      <properties>
+        <jackson.version>2.13.0</jackson.version>
+      </properties>
+    </profile>
+    <profile>
+      <id>b</id>
+      <properties>
+        <jackson.version>2.12.0</jackson.version>
+      </properties>
+    </profile>
+  </profiles>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+  </dependencies>`)
+
+	plan, out := run(t, map[string]string{"pom.xml": src}, jackson("2.15.4"))
+
+	if len(out) != 0 {
+		t.Errorf("must not pick one profile's property arbitrarily:\n%v", out)
+	}
+	if len(plan.Skipped) != 1 || !strings.Contains(plan.Skipped[0].Reason, "more than one profile") {
+		t.Errorf("want an ambiguity refusal, got %+v", plan.Skipped)
+	}
+}
+
+// Values that cannot be written into XML as-is are rejected up front rather
+// than escaped: escaping would produce a valid POM declaring a bad version.
+func TestRequestValuesAreValidated(t *testing.T) {
+	proj, err := Load(writeRepo(t, map[string]string{"pom.xml": pom(`  <dependencies/>`)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, req := range []Request{
+		{GroupID: "g", ArtifactID: "a", NewVersion: "2&3"},
+		{GroupID: "g", ArtifactID: "a", NewVersion: "1.0\"/><evil"},
+		{GroupID: "g<x", ArtifactID: "a", NewVersion: "1.0"},
+		{GroupID: "g", ArtifactID: "a", NewVersion: "1.0", CurrentVersion: "<bad>"},
+	} {
+		if _, err := BumpProject(proj, req); err == nil {
+			t.Errorf("want rejection for %+v", req)
+		}
+	}
+}
+
+// dependencyManagement is inherited, not aggregated. A module the root
+// aggregates but does not parent needs its own pin.
+func TestPinCoversEveryInheritanceRoot(t *testing.T) {
+	root := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.example</groupId>
+  <artifactId>root</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <modules>
+    <module>standalone</module>
+  </modules>
+</project>
+`
+	// Aggregated by root, but declares no <parent>, so it inherits nothing
+	// from it.
+	standalone := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.other</groupId>
+  <artifactId>standalone</artifactId>
+  <version>1.0.0</version>
+</project>
+`
+	req := jackson("2.15.4")
+	req.PinIfMissing = true
+	plan, out := run(t, map[string]string{
+		"pom.xml":            root,
+		"standalone/pom.xml": standalone,
+	}, req)
+
+	if !plan.Pinned {
+		t.Fatal("want a pin")
+	}
+	if len(out) != 2 {
+		t.Fatalf("want both inheritance roots pinned, got %d: %v", len(out), keysOf(out))
+	}
+	for _, p := range []string{"pom.xml", "standalone/pom.xml"} {
+		if !strings.Contains(out[p], "<dependencyManagement>") {
+			t.Errorf("%s did not get a pin:\n%s", p, out[p])
+		}
+	}
+}
+
+// A <relativePath> pointing at an unrelated POM must not pull that project
+// into scope, or its files become eligible for rewriting.
+func TestUnrelatedParentIsNotAdmitted(t *testing.T) {
+	child := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>real-parent</artifactId>
+    <version>1.0.0</version>
+    <relativePath>other/pom.xml</relativePath>
+  </parent>
+  <artifactId>app</artifactId>
+</project>
+`
+	other := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.unrelated</groupId>
+  <artifactId>something-else</artifactId>
+  <version>9.9.9</version>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.13.0</version>
+    </dependency>
+  </dependencies>
+</project>
+`
+	plan, out := run(t, map[string]string{
+		"pom.xml":       child,
+		"other/pom.xml": other,
+	}, jackson("2.15.4"))
+
+	if len(out) != 0 || len(plan.Edits) != 0 {
+		t.Errorf("an unrelated POM reached through <relativePath> must not be edited: %v", keysOf(out))
+	}
+}
+
+// Maven matches a local parent on all three coordinates. A version mismatch
+// means the child inherits from the repository, not from this file.
+func TestParentVersionMismatchBreaksTheChain(t *testing.T) {
+	parent := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.example</groupId>
+  <artifactId>parent</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <properties>
+    <jackson.version>2.13.0</jackson.version>
+  </properties>
+  <modules>
+    <module>child</module>
+  </modules>
+</project>
+`
+	// Declares version 2.0.0, but the local parent is 1.0.0, so the child
+	// actually inherits from the repository and not from this file.
+	child := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>2.0.0</version>
+  </parent>
+  <artifactId>child</artifactId>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+  </dependencies>
+</project>
+`
+	plan, _ := run(t, map[string]string{
+		"pom.xml":       parent,
+		"child/pom.xml": child,
+	}, jackson("2.15.4"))
+
+	if len(plan.Edits) != 0 {
+		t.Errorf("must not edit a parent the child does not actually inherit from: %+v", plan.Edits)
+	}
+	if len(plan.Skipped) != 1 {
+		t.Errorf("want the unresolved property reported, got %+v", plan.Skipped)
+	}
+}
+
+// Blast radius must include artifacts that interpolate the property into a
+// larger string; they move too.
+func TestSharedPropertyReportsCompositeReferences(t *testing.T) {
+	src := pom(`  <properties>
+    <jackson.version>2.13.0</jackson.version>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>helper</artifactId>
+      <version>${jackson.version}-tests</version>
+    </dependency>
+  </dependencies>`)
+
+	plan, _ := run(t, map[string]string{"pom.xml": src}, jackson("2.15.4"))
+
+	if len(plan.SharedProperties) != 1 {
+		t.Fatalf("want a shared-property report, got %+v", plan.SharedProperties)
+	}
+	if got := plan.SharedProperties[0].AlsoAffects; len(got) != 1 || got[0] != "com.example:helper" {
+		t.Errorf("want com.example:helper reported as also affected, got %v", got)
+	}
+}
+
+// A module directory that is a symlink out of the repository must not be
+// read or become writable through the project.
+func TestSymlinkedModuleOutsideRepoIsRefused(t *testing.T) {
+	outside := t.TempDir()
+	if err := os.WriteFile(filepath.Join(outside, "pom.xml"), []byte(`<?xml version="1.0"?>
+<project><groupId>com.outside</groupId><artifactId>x</artifactId><version>1</version>
+<dependencies><dependency><groupId>com.fasterxml.jackson.core</groupId>
+<artifactId>jackson-databind</artifactId><version>2.13.0</version></dependency></dependencies>
+</project>`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	repo := writeRepo(t, map[string]string{"pom.xml": `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.example</groupId>
+  <artifactId>app</artifactId>
+  <version>1.0.0</version>
+  <modules>
+    <module>escaped</module>
+  </modules>
+</project>
+`})
+	if err := os.Symlink(outside, filepath.Join(repo, "escaped")); err != nil {
+		t.Skipf("symlinks unavailable: %v", err)
+	}
+
+	proj, err := Load(repo)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	for _, p := range proj.Poms {
+		if p.Coord() == "com.outside:x" {
+			t.Fatal("a POM outside the repository was pulled in through a symlinked module")
+		}
+	}
+}
+
+func keysOf(m map[string]string) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}
+
 // assertReparses checks the rewritten content is still well-formed and that
 // the named coordinate now carries the expected version.
-func assertReparses(t *testing.T, content, coord, wantVersion string) {
+//
+// wantManaged must be set for pin tests: a pin that landed as a direct
+// <dependency> rather than inside <dependencyManagement> changes the module's
+// own dependency set, which is not what a transitive pin should do.
+func assertReparses(t *testing.T, content, coord, wantVersion string, wantManaged bool) {
 	t.Helper()
 	p, err := Parse("pom.xml", []byte(content))
 	if err != nil {
 		t.Fatalf("rewritten POM no longer parses: %v", err)
 	}
 	for _, d := range p.Declarations {
-		if d.Coord() == coord {
-			if d.Version != wantVersion {
-				t.Errorf("want %s at %s, got %q", coord, wantVersion, d.Version)
-			}
-			return
+		if d.Coord() != coord {
+			continue
 		}
+		if d.Version != wantVersion {
+			t.Errorf("want %s at %s, got %q", coord, wantVersion, d.Version)
+		}
+		if d.Managed != wantManaged {
+			t.Errorf("want %s Managed=%v, got %v", coord, wantManaged, d.Managed)
+		}
+		return
 	}
 	t.Errorf("%s not found in the rewritten POM", coord)
 }

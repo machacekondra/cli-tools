@@ -73,6 +73,11 @@ type Declaration struct {
 	// element tags and any whitespace or comments inside them. Empty when
 	// Version is empty.
 	VersionSpan Span
+
+	// VersionUnsafe, when non-empty, says why the version cannot be rewritten
+	// in place. The declaration is still reported, so the caller refuses
+	// loudly instead of silently doing nothing.
+	VersionUnsafe string
 }
 
 // Coord returns the groupId:artifactId key this declaration matches on.
@@ -84,6 +89,9 @@ type Property struct {
 	Value   string
 	Span    Span // the value text only
 	Profile string
+
+	// Unsafe, when non-empty, says why this property must not be rewritten.
+	Unsafe string
 }
 
 // ParentRef is a POM's <parent> block.
@@ -135,9 +143,22 @@ func (p *Pom) Coord() string {
 // node is a minimal XML element tree carrying byte offsets. encoding/xml does
 // not expose positions on a decoded struct, so we walk tokens ourselves.
 type node struct {
-	name     string
-	text     string
-	textSpan Span // the trimmed text, empty if the element has no text
+	name string
+
+	// text is the decoded value: entity references expanded, CDATA
+	// unwrapped. Semantic comparisons must use this.
+	text string
+
+	// textSpan is the raw byte range the decoded text came from. For plain
+	// text the two agree, but for `&amp;` or `<![CDATA[..]]>` the raw bytes
+	// differ from the decoded value, and splicing the decoded replacement
+	// over the raw span would be wrong.
+	textSpan Span
+
+	// spliceUnsafe says why this element's value must not be rewritten in
+	// place; empty when it is safe.
+	spliceUnsafe string
+
 	children []*node
 	span     Span // the whole element, from '<' to just past '>'
 
@@ -214,18 +235,32 @@ func parseTree(data []byte) (*node, error) {
 			if len(stack) == 0 {
 				continue
 			}
-			// Comments and processing instructions arrive as their own tokens,
-			// so an element like <version>1.2.3<!--pinned--></version> yields
-			// the version as a clean CharData of its own and needs no special
-			// handling. Keep the last non-blank run: that also covers the
-			// mirror case, <version><!--pinned-->1.2.3</version>.
-			if strings.TrimSpace(string(t)) == "" {
+			decoded := string(t)
+			if strings.TrimSpace(decoded) == "" {
 				continue
 			}
 			cur := stack[len(stack)-1]
+
+			// A comment or processing instruction splits the value into
+			// several runs: <version>1<!--x-->.0</version> arrives as "1"
+			// then ".0". No single span covers the whole value, so there is
+			// nothing safe to splice.
+			if cur.text != "" {
+				cur.spliceUnsafe = "value is split by a comment or processing instruction"
+				continue
+			}
+
 			raw := Span{Start: offset, End: int(dec.InputOffset())}
 			cur.textSpan = trimSpan(data, raw)
-			cur.text = string(data[cur.textSpan.Start:cur.textSpan.End])
+			cur.text = strings.TrimSpace(decoded)
+
+			// When the raw bytes differ from the decoded value -- an entity
+			// reference, or a CDATA wrapper -- the span covers markup rather
+			// than the value itself. Writing a plain replacement over it
+			// would delete the wrapper or corrupt the entity.
+			if string(data[cur.textSpan.Start:cur.textSpan.End]) != cur.text {
+				cur.spliceUnsafe = "value is CDATA-wrapped or uses XML entities"
+			}
 
 		case xml.EndElement:
 			if len(stack) == 0 {
@@ -329,12 +364,25 @@ func collectProperties(n *node, profile string, out map[string]Property) {
 			if existing, ok := out[c.name]; ok && existing.Profile == "" {
 				continue
 			}
-			out[c.name] = Property{
+			next := Property{
 				Name:    c.name,
 				Value:   c.text,
 				Span:    c.textSpan,
 				Profile: profile,
+				Unsafe:  c.spliceUnsafe,
 			}
+			// Two profiles can each declare the same property name. They are
+			// different declarations with different spans, and which one
+			// applies depends on which profile is active. Rewriting whichever
+			// we happened to index last would update one and silently leave
+			// the other on the vulnerable version.
+			if existing, ok := out[c.name]; ok && profile != "" && existing.Profile != "" &&
+				existing.Span != next.Span {
+				next.Unsafe = fmt.Sprintf(
+					"declared in more than one profile (%s, %s); cannot tell which applies",
+					existing.Profile, profile)
+			}
+			out[c.name] = next
 		}
 	}
 	if profile == "" {
@@ -403,6 +451,7 @@ func declarationFrom(n *node, kind Kind, managed bool, profile string) Declarati
 	if v := n.child("version"); v != nil && !v.textSpan.Empty() {
 		d.Version = v.text
 		d.VersionSpan = v.textSpan
+		d.VersionUnsafe = v.spliceUnsafe
 	}
 	return d
 }

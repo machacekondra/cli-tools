@@ -17,12 +17,31 @@ import (
 // It is also the one path that has to produce XML rather than splice an
 // existing span, so the generated text follows the file's own indentation and
 // is inserted at an anchor that leaves every other byte untouched.
-func pinEdit(proj *Project, req Request) (*Edit, error) {
-	root := proj.Pom("pom.xml")
-	if root == nil {
-		return nil, fmt.Errorf("cannot pin %s: no root pom.xml", req.Coord())
+// pinEdits produces one entry per inheritance root.
+//
+// A repository can contain POMs that the top-level pom.xml aggregates as
+// <modules> without being their <parent>. dependencyManagement is inherited,
+// not aggregated, so a pin written only to the top-level POM leaves those
+// modules resolving the vulnerable version while the command reports
+// success. Every POM with no in-repo parent therefore gets its own entry.
+func pinEdits(proj *Project, req Request) ([]Edit, error) {
+	roots := proj.InheritanceRoots()
+	if len(roots) == 0 {
+		return nil, fmt.Errorf("cannot pin %s: no POM without an in-repo parent", req.Coord())
 	}
 
+	edits := make([]Edit, 0, len(roots))
+	for _, root := range roots {
+		edit, err := pinEdit(root, req, len(roots) > 1)
+		if err != nil {
+			return nil, err
+		}
+		edits = append(edits, *edit)
+	}
+	return edits, nil
+}
+
+func pinEdit(root *Pom, req Request, multipleTrees bool) (*Edit, error) {
 	indent := detectIndent(root.Content, root.root)
 	anchor, depth, err := pinAnchor(root)
 	if err != nil {
@@ -47,11 +66,17 @@ func pinEdit(proj *Project, req Request) (*Edit, error) {
 		b.WriteString(ind + "</dependencyManagement>\n")
 	}
 
+	desc := fmt.Sprintf("pin %s to %s via dependencyManagement (not directly declared)",
+		req.Coord(), req.NewVersion)
+	if multipleTrees {
+		desc += " (one of several POMs with no in-repo parent)"
+	}
+
 	return &Edit{
 		Path:        root.Path,
 		Span:        Span{Start: anchor, End: anchor},
 		Replacement: b.String(),
-		Description: fmt.Sprintf("pin %s to %s via dependencyManagement (not directly declared)", req.Coord(), req.NewVersion),
+		Description: desc,
 	}, nil
 }
 
@@ -80,16 +105,22 @@ func pinAnchor(pom *Pom) (offset int, depth int, err error) {
 	if dm == nil {
 		return pom.root.contentEnd, 1, nil
 	}
+	// Both messages name a form this function accepts on retry: an expanded
+	// <dependencies></dependencies>. Suggesting the self-closing
+	// <dependencies/> would send the operator straight back to the error
+	// below, which rejects exactly that.
 	if selfClosing(dm) {
 		return 0, 0, fmt.Errorf(
-			"%s: <dependencyManagement/> is self-closing; expand it to <dependencyManagement><dependencies/></dependencyManagement> and retry",
+			"%s: <dependencyManagement/> is self-closing; expand it to "+
+				"<dependencyManagement><dependencies></dependencies></dependencyManagement> and retry",
 			pom.Path)
 	}
 
 	deps := dm.child("dependencies")
 	if deps == nil || selfClosing(deps) {
 		return 0, 0, fmt.Errorf(
-			"%s: <dependencyManagement> has no expanded <dependencies> element; add one and retry",
+			"%s: <dependencyManagement> has no expanded <dependencies> element; "+
+				"add <dependencies></dependencies> inside it and retry",
 			pom.Path)
 	}
 

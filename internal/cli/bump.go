@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -54,15 +55,18 @@ Nothing is rewritten silently: every declaration that matched but was
 deliberately left alone is reported, as is every other artifact moved by a
 shared property.`,
 		Args: cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, _ []string) error {
-			if err := bindEnv(cmd, map[string]string{
+		// Environment binding must happen in PreRunE: cobra checks required
+		// flags after PreRunE but before RunE, so binding in RunE made
+		// --package and --to impossible to supply via PACKAGE/FIXED_VERSION.
+		PreRunE: func(cmd *cobra.Command, _ []string) error {
+			return bindEnv(cmd, map[string]string{
 				"repo":    "REPO_PATH",
 				"package": "PACKAGE",
 				"to":      "FIXED_VERSION",
 				"from":    "CURRENT_VERSION",
-			}); err != nil {
-				return err
-			}
+			})
+		},
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runBumpMaven(cmd, &o)
 		},
 	}
@@ -146,15 +150,8 @@ func runBumpMaven(cmd *cobra.Command, o *bumpOpts) error {
 	}
 
 	if !o.dryRun {
-		for path, content := range updated {
-			full := filepath.Join(o.repo, filepath.FromSlash(path))
-			info, err := os.Stat(full)
-			if err != nil {
-				return fmt.Errorf("stat %s: %w", path, err)
-			}
-			if err := os.WriteFile(full, content, info.Mode().Perm()); err != nil {
-				return fmt.Errorf("writing %s: %w", path, err)
-			}
+		if err := writeAll(o.repo, proj, updated); err != nil {
+			return err
 		}
 	}
 
@@ -179,11 +176,94 @@ func runBumpMaven(cmd *cobra.Command, o *bumpOpts) error {
 		return err
 	}
 
+	// A declaration we refused to rewrite leaves the artifact vulnerable
+	// through that module, even when other modules were updated. Exiting
+	// zero there would let a pipeline treat a partial remediation as a
+	// complete one.
+	if len(plan.Skipped) > 0 && !o.noMatch {
+		return fmt.Errorf("%d declaration(s) of %s could not be updated; see the skipped entries above",
+			len(plan.Skipped), o.pkg)
+	}
+
 	// Finding nothing is the dangerous outcome for a security remediation:
 	// the pipeline would open a PR that fixes nothing. Fail unless asked not
 	// to. Finding it already at the target version is a success.
 	if len(plan.Edits) == 0 && !plan.AlreadySatisfied && !o.noMatch {
 		return fmt.Errorf("nothing to change for %s", o.pkg)
+	}
+	return nil
+}
+
+// writeAll stages every rewritten POM beside its original and renames it into
+// place only once all of them are written.
+//
+// A plain WriteFile truncates before it writes, so a failure partway through
+// the set leaves one POM half-written. The next run would then fail to parse
+// the repository at all, turning a recoverable error into a broken checkout.
+// Staging first means a failure leaves every original intact.
+func writeAll(repo string, proj *maven.Project, updated map[string][]byte) error {
+	type staged struct{ tmp, dst string }
+	var ready []staged
+
+	cleanup := func() {
+		for _, s := range ready {
+			_ = os.Remove(s.tmp)
+		}
+	}
+
+	for path, content := range updated {
+		dst := filepath.Join(repo, filepath.FromSlash(path))
+
+		info, err := os.Stat(dst)
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("stat %s: %w", path, err)
+		}
+
+		// The plan was computed from the bytes read at load time. If the file
+		// has changed since, those offsets describe a file that no longer
+		// exists and writing would discard someone else's edit.
+		current, err := os.ReadFile(dst)
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("re-reading %s: %w", path, err)
+		}
+		if pom := proj.Pom(path); pom != nil && !bytes.Equal(current, pom.Content) {
+			cleanup()
+			return fmt.Errorf("%s changed on disk after it was read; re-run the command", path)
+		}
+
+		tmp, err := os.CreateTemp(filepath.Dir(dst), ".tssc-bump-*")
+		if err != nil {
+			cleanup()
+			return fmt.Errorf("staging %s: %w", path, err)
+		}
+		_, writeErr := tmp.Write(content)
+		closeErr := tmp.Close()
+		if writeErr == nil {
+			writeErr = closeErr
+		}
+		if writeErr == nil {
+			writeErr = os.Chmod(tmp.Name(), info.Mode().Perm())
+		}
+		if writeErr != nil {
+			_ = os.Remove(tmp.Name())
+			cleanup()
+			return fmt.Errorf("staging %s: %w", path, writeErr)
+		}
+		ready = append(ready, staged{tmp: tmp.Name(), dst: dst})
+	}
+
+	// Renames are the only destructive step, and each is atomic. One can
+	// still fail after an earlier one succeeded, so say which files landed
+	// rather than leaving the caller to guess.
+	var done []string
+	for _, s := range ready {
+		if err := os.Rename(s.tmp, s.dst); err != nil {
+			_ = os.Remove(s.tmp)
+			return fmt.Errorf("replacing %s: %w (already updated: %v)", s.dst, err, done)
+		}
+		done = append(done, s.dst)
 	}
 	return nil
 }
@@ -197,31 +277,44 @@ func report(cmd *cobra.Command, o *bumpOpts, res result) error {
 		return enc.Encode(res)
 	}
 
+	// Collect the first write error rather than ignoring every one: a report
+	// that silently vanished because stdout was a closed pipe must not look
+	// like a successful run.
+	var writeErr error
+	line := func(format string, args ...any) {
+		if writeErr != nil {
+			return
+		}
+		if _, err := fmt.Fprintf(out, format, args...); err != nil {
+			writeErr = err
+		}
+	}
+
 	switch {
 	case res.AlreadySatisfied:
-		fmt.Fprintf(out, "no change: %s is already at %s\n", res.Package, res.Version)
+		line("no change: %s is already at %s\n", res.Package, res.Version)
 	case len(res.Changed) == 0 && len(res.Skipped) > 0:
 		// It was found; we declined to rewrite it. The per-skip lines below
 		// say why, so do not also claim it is undeclared.
-		fmt.Fprintf(out, "no change: %s was found but not rewritten\n", res.Package)
+		line("no change: %s was found but not rewritten\n", res.Package)
 	case len(res.Changed) == 0:
-		fmt.Fprintf(out, "no change: %s is not declared in this repository\n", res.Package)
+		line("no change: %s is not declared in this repository\n", res.Package)
 	}
 	for _, c := range res.Changed {
 		prefix := "updated"
 		if o.dryRun {
 			prefix = "would update"
 		}
-		fmt.Fprintf(out, "%s %s: %s\n", prefix, c.File, c.Description)
+		line("%s %s: %s\n", prefix, c.File, c.Description)
 	}
 	for _, s := range res.Shared {
-		fmt.Fprintf(out, "\nnote: property %s in %s also sets the version of:\n", s.Property, s.File)
+		line("\nnote: property %s in %s also sets the version of:\n", s.Property, s.File)
 		for _, c := range s.AlsoAffects {
-			fmt.Fprintf(out, "  - %s\n", c)
+			line("  - %s\n", c)
 		}
 	}
 	for _, s := range res.Skipped {
-		fmt.Fprintf(out, "skipped %s: %s\n", s.File, s.Reason)
+		line("skipped %s: %s\n", s.File, s.Reason)
 	}
-	return nil
+	return writeErr
 }

@@ -28,6 +28,47 @@ type Request struct {
 // Coord is the groupId:artifactId this request targets.
 func (r Request) Coord() string { return r.GroupID + ":" + r.ArtifactID }
 
+// validate rejects inputs that cannot be written into a POM as-is.
+//
+// These values reach us from an LLM remediation step, so they are not
+// guaranteed well formed. Rejecting is the right answer rather than XML
+// escaping: a version containing '&' is a bad input, and silently turning it
+// into "&amp;" would produce a valid POM that declares a nonsense version.
+func (r Request) validate() error {
+	if r.GroupID == "" || r.ArtifactID == "" {
+		return fmt.Errorf("package must be groupId:artifactId")
+	}
+	if r.NewVersion == "" {
+		return fmt.Errorf("target version must not be empty")
+	}
+	for _, f := range []struct{ name, value string }{
+		{"groupId", r.GroupID},
+		{"artifactId", r.ArtifactID},
+		{"version", r.NewVersion},
+		{"current version", r.CurrentVersion},
+	} {
+		if f.value == "" {
+			continue
+		}
+		if i := strings.IndexFunc(f.value, invalidInCoordinate); i >= 0 {
+			return fmt.Errorf("%s %q contains an unsupported character %q",
+				f.name, f.value, string([]rune(f.value[i:])[0]))
+		}
+	}
+	return nil
+}
+
+// invalidInCoordinate reports characters that may not appear in a Maven
+// coordinate or version: XML metacharacters, quotes, whitespace and control
+// characters. Everything a real coordinate uses stays allowed.
+func invalidInCoordinate(r rune) bool {
+	switch r {
+	case '<', '>', '&', '"', '\'':
+		return true
+	}
+	return r <= ' ' || r == 0x7f
+}
+
 // Edit is one byte-range splice.
 type Edit struct {
 	Path        string
@@ -82,11 +123,8 @@ func (p *Plan) Empty() bool { return len(p.Edits) == 0 }
 // artifact, and every declaration of it needs the fix, not just the one whose
 // classifier happens to line up.
 func BumpProject(proj *Project, req Request) (*Plan, error) {
-	if req.GroupID == "" || req.ArtifactID == "" {
-		return nil, fmt.Errorf("package must be groupId:artifactId")
-	}
-	if req.NewVersion == "" {
-		return nil, fmt.Errorf("target version must not be empty")
+	if err := req.validate(); err != nil {
+		return nil, err
 	}
 
 	plan := &Plan{}
@@ -142,11 +180,11 @@ func BumpProject(proj *Project, req Request) (*Plan, error) {
 	plan.AlreadySatisfied = rewritable && len(plan.Edits) == 0 && len(plan.Skipped) == 0
 
 	if !rewritable && len(plan.Skipped) == 0 && req.PinIfMissing {
-		edit, err := pinEdit(proj, req)
+		edits, err := pinEdits(proj, req)
 		if err != nil {
 			return nil, err
 		}
-		plan.Edits = append(plan.Edits, *edit)
+		plan.Edits = append(plan.Edits, edits...)
 		plan.Pinned = true
 	}
 
@@ -175,6 +213,61 @@ func resolveTarget(proj *Project, pom *Pom, decl Declaration, req Request) (*tar
 		return nil, nil
 	}
 
+	if name, isRef := PropertyRef(decl.Version); isRef {
+		// Follow the whole chain. The first hop may be an alias for another
+		// property, and it is the terminal one that holds the real value and
+		// must carry the edit.
+		resolved, ok := proj.resolveChain(pom, decl.Version)
+		if !ok {
+			return nil, &Skip{
+				Pom: pom.Path,
+				Reason: fmt.Sprintf(
+					"version property ${%s} does not resolve to a literal in this repository "+
+						"(undeclared, cyclic, or composed from several properties)", name),
+			}
+		}
+		if resolved.Unsafe != "" {
+			return nil, &Skip{
+				Pom:    resolved.Pom.Path,
+				Reason: fmt.Sprintf("property %s cannot be rewritten: %s", resolved.Name, resolved.Unsafe),
+			}
+		}
+		// Check the resolved literal, not the placeholder: a property can
+		// perfectly well hold a range, and ${x} never looks like one.
+		if isRange(resolved.Value) {
+			return nil, &Skip{
+				Pom: resolved.Pom.Path,
+				Reason: fmt.Sprintf("property %s holds the range %q; refusing to replace it with a fixed version",
+					resolved.Name, resolved.Value),
+			}
+		}
+		if drift := checkDrift(req, resolved.Value); drift != "" {
+			return nil, &Skip{Pom: resolved.Pom.Path, Reason: drift}
+		}
+		if resolved.Value == req.NewVersion {
+			return nil, nil // already at the target version
+		}
+		desc := fmt.Sprintf("property %s: %s -> %s", resolved.Name, resolved.Value, req.NewVersion)
+		if resolved.Pom.Path != pom.Path {
+			desc += fmt.Sprintf(" (declared here, used by %s)", pom.Path)
+		}
+		return &target{
+			pom:         resolved.Pom,
+			span:        resolved.Span,
+			property:    resolved.Name,
+			description: desc,
+		}, nil
+	}
+
+	// A version that embeds a placeholder in a larger string, like
+	// "${base}.1" or "${a}-${b}", has no single span that can be replaced.
+	if strings.Contains(decl.Version, "${") {
+		return nil, &Skip{
+			Pom:    pom.Path,
+			Reason: fmt.Sprintf("version %q interpolates a property into a larger string; cannot rewrite in place", decl.Version),
+		}
+	}
+
 	// Ranges and hard requirements are a deliberate expression of intent and
 	// cannot be replaced by a single version without changing meaning.
 	if isRange(decl.Version) {
@@ -184,33 +277,10 @@ func resolveTarget(proj *Project, pom *Pom, decl Declaration, req Request) (*tar
 		}
 	}
 
-	if name, isRef := PropertyRef(decl.Version); isRef {
-		resolved, ok := proj.resolveProperty(pom, name)
-		if !ok {
-			return nil, &Skip{
-				Pom:    pom.Path,
-				Reason: fmt.Sprintf("version property ${%s} is not declared in this repository (it may come from a remote parent)", name),
-			}
-		}
-		if drift := checkDrift(req, resolved.Value); drift != "" {
-			return nil, &Skip{Pom: resolved.Pom.Path, Reason: drift}
-		}
-		if resolved.Value == req.NewVersion {
-			return nil, nil // already at the target version
-		}
-		desc := fmt.Sprintf("property %s: %s -> %s", name, resolved.Value, req.NewVersion)
-		if resolved.Pom.Path != pom.Path {
-			desc += fmt.Sprintf(" (declared here, used by %s)", pom.Path)
-		}
-		return &target{pom: resolved.Pom, span: resolved.Span, property: name, description: desc}, nil
-	}
-
-	// A version that embeds a placeholder in a larger string, like
-	// "${base}.1" or "${a}-${b}", has no single span that can be replaced.
-	if strings.Contains(decl.Version, "${") {
+	if decl.VersionUnsafe != "" {
 		return nil, &Skip{
 			Pom:    pom.Path,
-			Reason: fmt.Sprintf("version %q interpolates a property into a larger string; cannot rewrite in place", decl.Version),
+			Reason: fmt.Sprintf("version cannot be rewritten: %s", decl.VersionUnsafe),
 		}
 	}
 
@@ -235,6 +305,12 @@ func checkDrift(req Request, found string) string {
 	return fmt.Sprintf("expected current version %q but found %q; refusing to overwrite", req.CurrentVersion, found)
 }
 
+// referencesProperty reports whether a version literal mentions ${name}
+// anywhere, including inside a larger expression.
+func referencesProperty(version, name string) bool {
+	return strings.Contains(version, "${"+name+"}")
+}
+
 // isRange reports whether a Maven version is a range or hard requirement
 // rather than a plain version.
 func isRange(v string) bool {
@@ -252,13 +328,16 @@ func sharedProperty(proj *Project, t *target, req Request) *SharedProperty {
 			if decl.Coord() == req.Coord() || decl.Version == "" {
 				continue
 			}
-			name, isRef := PropertyRef(decl.Version)
-			if !isRef || name != t.property {
+			// Match every reference to the property, not only versions that
+			// are exactly "${name}". An artifact declared as
+			// "${lib.version}-tests" also moves when the property changes,
+			// and omitting it would understate the blast radius.
+			if !referencesProperty(decl.Version, t.property) {
 				continue
 			}
-			// Same property name in a different file may be a different
-			// property; only count it when it resolves to the same declaration.
-			resolved, ok := proj.resolveProperty(pom, name)
+			// The same property name in a different file may be a different
+			// property; only count it when it resolves to this declaration.
+			resolved, ok := proj.resolveProperty(pom, t.property)
 			if ok && resolved.Pom.Path == t.pom.Path && resolved.Span == t.span {
 				others[decl.Coord()] = true
 			}
