@@ -1,0 +1,58 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Verify go.mod is tidy
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Verify formatting
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt needed on:"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - run: go vet ./...
+
+      - run: go test ./... -race -coverprofile=coverage.out
+
+      - uses: golangci/golangci-lint-action@v8
+
+  image:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v5
+
+      # Build on PRs too: the Containerfile is part of the contract, and a
+      # broken one should not be discovered at release time.
+      - name: Build image
+        run: |
+          podman build \
+            --build-arg VERSION="$(git describe --tags --always --dirty)" \
+            --build-arg COMMIT="$(git rev-parse --short HEAD)" \
+            -t tssc-cli-tools:ci -f Containerfile .
+
+      - name: Smoke test
+        run: podman run --rm tssc-cli-tools:ci --version
