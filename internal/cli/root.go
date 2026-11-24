@@ -22,11 +22,16 @@ func NewRootCmd() *cobra.Command {
 		Short:        "Supply-chain security tools for the TSSC pipelines",
 		Version:      version.String(),
 		SilenceUsage: true, // a runtime failure is not a usage error
+		// main prints the error; without this cobra prints it too.
+		SilenceErrors: true,
 	}
 
 	root.PersistentFlags().String("results-dir", "",
 		"directory to write Tekton results into (default: /tekton/results when it exists, otherwise results are not written)")
 
+	root.AddCommand(
+		newBumpCmd(),
+	)
 	return root
 }
 
