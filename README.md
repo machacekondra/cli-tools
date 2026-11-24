@@ -30,6 +30,24 @@ The image also installs busybox-style symlinks, so a Task can call
 - Tasks in `tekton/tasks/` map params to flags and nothing else — no
   `script:` blocks.
 
+## Published image
+
+`quay.io/project-lightpath/tssc-cli-tools`, built for `linux/amd64` and
+`linux/arm64`. CI publishes on every merge to `main` and on `v*` tags:
+
+| tag | meaning |
+|---|---|
+| `sha-<short>` | one exact build; immutable |
+| `latest` | most recent merge to `main` |
+| `vX.Y.Z` | a released tag |
+
+Pin by digest in a Tekton Task rather than by tag — the digest is printed in
+the publish job's summary:
+
+```yaml
+image: quay.io/project-lightpath/tssc-cli-tools@sha256:...
+```
+
 ## Development
 
 ```
