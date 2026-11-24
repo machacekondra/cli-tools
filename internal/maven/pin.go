@@ -24,8 +24,7 @@ import (
 // not aggregated, so a pin written only to the top-level POM leaves those
 // modules resolving the vulnerable version while the command reports
 // success. Every POM with no in-repo parent therefore gets its own entry.
-func pinEdits(proj *Project, req Request) ([]Edit, error) {
-	roots := proj.InheritanceRoots()
+func pinEdits(roots []*Pom, req Request) ([]Edit, error) {
 	if len(roots) == 0 {
 		return nil, fmt.Errorf("cannot pin %s: no POM without an in-repo parent", req.Coord())
 	}
@@ -116,11 +115,21 @@ func pinAnchor(pom *Pom) (offset int, depth int, err error) {
 			pom.Path)
 	}
 
+	// The two cases need different instructions. Telling someone to add
+	// <dependencies></dependencies> when a self-closing <dependencies/> is
+	// already there does not help: the lookup below still finds the first,
+	// self-closing element and fails again.
 	deps := dm.child("dependencies")
-	if deps == nil || selfClosing(deps) {
+	if deps == nil {
 		return 0, 0, fmt.Errorf(
-			"%s: <dependencyManagement> has no expanded <dependencies> element; "+
+			"%s: <dependencyManagement> contains no <dependencies> element; "+
 				"add <dependencies></dependencies> inside it and retry",
+			pom.Path)
+	}
+	if selfClosing(deps) {
+		return 0, 0, fmt.Errorf(
+			"%s: <dependencyManagement> contains a self-closing <dependencies/>; "+
+				"expand that element to <dependencies></dependencies> and retry",
 			pom.Path)
 	}
 

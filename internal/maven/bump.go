@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // Request describes the bump to perform. The coordinate and target version
@@ -41,6 +42,12 @@ func (r Request) validate() error {
 	if r.NewVersion == "" {
 		return fmt.Errorf("target version must not be empty")
 	}
+	// Writing a range as the target would leave the declaration holding a
+	// range, which the next run then refuses as unrewritable -- so the
+	// repository ends up in a state this tool cannot move out of.
+	if isRange(r.NewVersion) {
+		return fmt.Errorf("target version %q is a range; a fixed version is required", r.NewVersion)
+	}
 	for _, f := range []struct{ name, value string }{
 		{"groupId", r.GroupID},
 		{"artifactId", r.ArtifactID},
@@ -50,23 +57,49 @@ func (r Request) validate() error {
 		if f.value == "" {
 			continue
 		}
-		if i := strings.IndexFunc(f.value, invalidInCoordinate); i >= 0 {
-			return fmt.Errorf("%s %q contains an unsupported character %q",
-				f.name, f.value, string([]rune(f.value[i:])[0]))
+		if !utf8.ValidString(f.value) {
+			return fmt.Errorf("%s is not valid UTF-8", f.name)
+		}
+		for _, c := range f.value {
+			if invalidInCoordinate(c) {
+				return fmt.Errorf("%s %q contains an unsupported character %q", f.name, f.value, c)
+			}
 		}
 	}
 	return nil
 }
 
 // invalidInCoordinate reports characters that may not appear in a Maven
-// coordinate or version: XML metacharacters, quotes, whitespace and control
-// characters. Everything a real coordinate uses stays allowed.
+// coordinate or version: XML metacharacters, quotes, whitespace, control
+// characters, and anything outside the XML 1.0 character range.
+//
+// The last group matters because a value like U+FFFE survives a naive check
+// and is written verbatim, after which the POM no longer parses -- the tool
+// would report a successful bump and leave behind a file Maven cannot read.
 func invalidInCoordinate(r rune) bool {
 	switch r {
 	case '<', '>', '&', '"', '\'':
 		return true
 	}
-	return r <= ' ' || r == 0x7f
+	if r <= ' ' || r == 0x7f {
+		return true
+	}
+	return !validXMLChar(r)
+}
+
+// validXMLChar implements the Char production from the XML 1.0 specification.
+func validXMLChar(r rune) bool {
+	switch {
+	case r == 0x09 || r == 0x0a || r == 0x0d:
+		return true
+	case r >= 0x20 && r <= 0xd7ff:
+		return true
+	case r >= 0xe000 && r <= 0xfffd:
+		return true
+	case r >= 0x10000 && r <= 0x10ffff:
+		return true
+	}
+	return false
 }
 
 // Edit is one byte-range splice.
@@ -132,12 +165,16 @@ func BumpProject(proj *Project, req Request) (*Plan, error) {
 	// property, and the same span must not be spliced twice.
 	seen := map[string]bool{}
 
-	// rewritable records that we found a declaration carrying a version we
-	// could act on -- whether we rewrote it, refused it, or found it already
-	// correct. Pinning is only right when there was no such declaration at
-	// all; otherwise a re-run of a completed bump would add a redundant
-	// dependencyManagement entry on every invocation.
-	rewritable := false
+	// covered records, per inheritance root, that the artifact is already
+	// declared with a version somewhere in that root's tree -- whether we
+	// rewrote it, refused it, or found it already correct.
+	//
+	// This is tracked per root rather than globally because
+	// dependencyManagement is inherited, not shared. If a previous run
+	// pinned root A and failed before pinning root B, a global flag would
+	// see A's new entry, conclude the work was done and report success
+	// while B stayed vulnerable.
+	covered := map[string]bool{}
 
 	for _, pom := range proj.Poms {
 		for _, decl := range pom.Declarations {
@@ -145,7 +182,7 @@ func BumpProject(proj *Project, req Request) (*Plan, error) {
 				continue
 			}
 			if decl.Version != "" {
-				rewritable = true
+				covered[proj.inheritanceRootOf(pom).Path] = true
 			}
 			target, skip := resolveTarget(proj, pom, decl, req)
 			if skip != nil {
@@ -177,16 +214,27 @@ func BumpProject(proj *Project, req Request) (*Plan, error) {
 		}
 	}
 
-	plan.AlreadySatisfied = rewritable && len(plan.Edits) == 0 && len(plan.Skipped) == 0
+	// Pin only the inheritance roots whose tree does not already declare the
+	// artifact, so a retry after a partially applied pin completes the job
+	// instead of concluding it was already done.
+	var uncovered []*Pom
+	for _, root := range proj.InheritanceRoots() {
+		if !covered[root.Path] {
+			uncovered = append(uncovered, root)
+		}
+	}
 
-	if !rewritable && len(plan.Skipped) == 0 && req.PinIfMissing {
-		edits, err := pinEdits(proj, req)
+	if len(uncovered) > 0 && len(plan.Skipped) == 0 && req.PinIfMissing {
+		edits, err := pinEdits(uncovered, req)
 		if err != nil {
 			return nil, err
 		}
 		plan.Edits = append(plan.Edits, edits...)
 		plan.Pinned = true
 	}
+
+	plan.AlreadySatisfied = len(covered) > 0 && len(uncovered) == 0 &&
+		len(plan.Edits) == 0 && len(plan.Skipped) == 0
 
 	sort.Slice(plan.Edits, func(i, j int) bool {
 		if plan.Edits[i].Path != plan.Edits[j].Path {
@@ -211,6 +259,17 @@ func resolveTarget(proj *Project, pom *Pom, decl Declaration, req Request) (*tar
 	// does carry the version will be matched separately.
 	if decl.Version == "" {
 		return nil, nil
+	}
+
+	// This must come before the property branch. A split value is recorded
+	// in full but has no single span, and checking it only on the literal
+	// path meant "${base}<!--c-->-tests" reached the property branch and
+	// edited base, which is not what the declaration says at all.
+	if decl.VersionUnsafe != "" {
+		return nil, &Skip{
+			Pom:    pom.Path,
+			Reason: fmt.Sprintf("version %q cannot be rewritten: %s", decl.Version, decl.VersionUnsafe),
+		}
 	}
 
 	if name, isRef := PropertyRef(decl.Version); isRef {
@@ -277,13 +336,6 @@ func resolveTarget(proj *Project, pom *Pom, decl Declaration, req Request) (*tar
 		}
 	}
 
-	if decl.VersionUnsafe != "" {
-		return nil, &Skip{
-			Pom:    pom.Path,
-			Reason: fmt.Sprintf("version cannot be rewritten: %s", decl.VersionUnsafe),
-		}
-	}
-
 	if drift := checkDrift(req, decl.Version); drift != "" {
 		return nil, &Skip{Pom: pom.Path, Reason: drift}
 	}
@@ -328,17 +380,27 @@ func sharedProperty(proj *Project, t *target, req Request) *SharedProperty {
 			if decl.Coord() == req.Coord() || decl.Version == "" {
 				continue
 			}
-			// Match every reference to the property, not only versions that
-			// are exactly "${name}". An artifact declared as
-			// "${lib.version}-tests" also moves when the property changes,
-			// and omitting it would understate the blast radius.
-			if !referencesProperty(decl.Version, t.property) {
+			// Two ways a declaration can move with this edit.
+			//
+			// Directly: its version mentions ${name} somewhere, including
+			// inside a larger expression like "${lib.version}-tests".
+			// Matching only exact "${name}" versions understated the radius.
+			if referencesProperty(decl.Version, t.property) {
+				// The same property name in a different file may be a
+				// different property; only count it when it resolves here.
+				resolved, ok := proj.resolveProperty(pom, t.property)
+				if ok && resolved.Pom.Path == t.pom.Path && resolved.Span == t.span {
+					others[decl.Coord()] = true
+				}
 				continue
 			}
-			// The same property name in a different file may be a different
-			// property; only count it when it resolves to this declaration.
-			resolved, ok := proj.resolveProperty(pom, t.property)
-			if ok && resolved.Pom.Path == t.pom.Path && resolved.Span == t.span {
+
+			// Through an alias: the version is ${other}, and ${other} is
+			// itself defined as ${name}. A substring test never sees the
+			// edited property, so follow the chain and compare where it
+			// lands.
+			if resolved, ok := proj.resolveChain(pom, decl.Version); ok &&
+				resolved.Pom.Path == t.pom.Path && resolved.Span == t.span {
 				others[decl.Coord()] = true
 			}
 		}

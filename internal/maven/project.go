@@ -298,13 +298,23 @@ func (p *Project) resolveChain(pom *Pom, version string) (ResolvedProperty, bool
 		}
 		seen[name] = true
 
+		// The lookup context stays the POM that consumes the version, for
+		// every hop. Maven assembles inheritance into an effective model and
+		// only then interpolates, so a parent's alias "${base}" resolves
+		// against the child's override of base, not the parent's. Switching
+		// context to the declaring POM here read the parent's value and
+		// edited the wrong property.
 		resolved, ok := p.resolveProperty(pom, name)
 		if !ok {
 			return ResolvedProperty{}, false
 		}
-		// Each hop may be declared in a different POM; resolve the next hop
-		// from the POM that declared this one, as Maven does.
-		pom = resolved.Pom
+		// An ambiguous hop must stop the walk. Continuing would replace it
+		// with whatever unambiguous literal it happens to point at, and we
+		// would edit that confidently while another profile's chain still
+		// pointed somewhere else.
+		if resolved.Unsafe != "" {
+			return resolved, true
+		}
 		last = resolved
 		cur = resolved.Value
 	}
@@ -336,4 +346,11 @@ func (p *Project) InheritanceRoots() []*Pom {
 		}
 	}
 	return roots
+}
+
+// inheritanceRootOf returns the top of pom's inheritance tree, which is the
+// POM whose dependencyManagement pom inherits.
+func (p *Project) inheritanceRootOf(pom *Pom) *Pom {
+	chain := p.ancestors(pom)
+	return chain[len(chain)-1]
 }

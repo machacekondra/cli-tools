@@ -240,25 +240,31 @@ func parseTree(data []byte) (*node, error) {
 				continue
 			}
 			cur := stack[len(stack)-1]
+			trimmed := trimSpan(data, Span{Start: offset, End: int(dec.InputOffset())})
 
 			// A comment or processing instruction splits the value into
 			// several runs: <version>1<!--x-->.0</version> arrives as "1"
-			// then ".0". No single span covers the whole value, so there is
-			// nothing safe to splice.
+			// then ".0". Every run must be kept, because the value is what
+			// matching is done on -- dropping the tail once turned
+			// "${base}-tests" into "${base}", which then looked like a clean
+			// property reference, and "lib-extra" into "lib", which matched
+			// a request for a different artifact. No single span covers a
+			// split value, so it is recorded as unsafe to splice but still
+			// reported in full.
 			if cur.text != "" {
+				cur.text += strings.TrimSpace(decoded)
 				cur.spliceUnsafe = "value is split by a comment or processing instruction"
 				continue
 			}
 
-			raw := Span{Start: offset, End: int(dec.InputOffset())}
-			cur.textSpan = trimSpan(data, raw)
+			cur.textSpan = trimmed
 			cur.text = strings.TrimSpace(decoded)
 
 			// When the raw bytes differ from the decoded value -- an entity
 			// reference, or a CDATA wrapper -- the span covers markup rather
 			// than the value itself. Writing a plain replacement over it
 			// would delete the wrapper or corrupt the entity.
-			if string(data[cur.textSpan.Start:cur.textSpan.End]) != cur.text {
+			if string(data[trimmed.Start:trimmed.End]) != cur.text {
 				cur.spliceUnsafe = "value is CDATA-wrapped or uses XML entities"
 			}
 

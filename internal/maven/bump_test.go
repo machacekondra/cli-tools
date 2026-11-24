@@ -1079,6 +1079,260 @@ func TestSymlinkedModuleOutsideRepoIsRefused(t *testing.T) {
 	}
 }
 
+// A value split by a comment must be reported in full. Truncating it to the
+// first run made "${base}-tests" look like a bare property reference, so the
+// property branch happily edited base; and it turned "lib-extra" into "lib",
+// which matches a request for a different artifact entirely.
+func TestSplitValuesAreKeptWhole(t *testing.T) {
+	t.Run("version keeps every run and is refused", func(t *testing.T) {
+		src := pom(`  <properties>
+    <base>2.13.0</base>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${base}<!--c-->-tests</version>
+    </dependency>
+  </dependencies>`)
+
+		plan, out := run(t, map[string]string{"pom.xml": src}, jackson("2.15.4"))
+
+		if len(out) != 0 {
+			t.Errorf("must not edit through a split version:\n%v", out)
+		}
+		if strings.Contains(out["pom.xml"], "<base>2.15.4</base>") {
+			t.Error("edited the property behind a composite expression")
+		}
+		if len(plan.Skipped) != 1 {
+			t.Fatalf("want a refusal, got %+v", plan.Skipped)
+		}
+		if !strings.Contains(plan.Skipped[0].Reason, "${base}-tests") {
+			t.Errorf("refusal should quote the whole version, got %q", plan.Skipped[0].Reason)
+		}
+	})
+
+	t.Run("artifactId keeps every run", func(t *testing.T) {
+		p, err := Parse("pom.xml", []byte(pom(`  <dependencies>
+    <dependency>
+      <groupId>com.x</groupId>
+      <artifactId>lib<!--c-->-extra</artifactId>
+      <version>1.0</version>
+    </dependency>
+  </dependencies>`)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, d := range p.Declarations {
+			if d.GroupID == "com.x" && d.Coord() != "com.x:lib-extra" {
+				t.Errorf("artifactId truncated: got %q, want com.x:lib-extra", d.Coord())
+			}
+		}
+	})
+}
+
+// Maven assembles inheritance into an effective model and only then
+// interpolates, so a parent's alias resolves against the child's override.
+func TestAliasResolvesInTheConsumingPomsContext(t *testing.T) {
+	parent := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.example</groupId>
+  <artifactId>parent</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <properties>
+    <alias>${base}</alias>
+    <base>1.0.0</base>
+  </properties>
+  <modules>
+    <module>child</module>
+  </modules>
+</project>
+`
+	child := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <parent>
+    <groupId>com.example</groupId>
+    <artifactId>parent</artifactId>
+    <version>1.0.0</version>
+  </parent>
+  <artifactId>child</artifactId>
+  <properties>
+    <base>2.13.0</base>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${alias}</version>
+    </dependency>
+  </dependencies>
+</project>
+`
+	req := jackson("2.15.4")
+	req.CurrentVersion = "2.13.0" // the child's override, not the parent's 1.0.0
+	plan, out := run(t, map[string]string{
+		"pom.xml":       parent,
+		"child/pom.xml": child,
+	}, req)
+
+	if len(plan.Skipped) != 0 {
+		t.Fatalf("resolved against the parent's base instead of the child's: %+v", plan.Skipped)
+	}
+	if !strings.Contains(out["child/pom.xml"], "<base>2.15.4</base>") {
+		t.Errorf("want the child's base bumped:\n%s", out["child/pom.xml"])
+	}
+	if strings.Contains(out["pom.xml"], "2.15.4") {
+		t.Errorf("the parent's base must be left alone:\n%s", out["pom.xml"])
+	}
+}
+
+// An ambiguous hop must stop the walk; continuing resolves it to whatever
+// literal it happens to point at and edits that with false confidence.
+func TestAmbiguousIntermediateHopIsRefused(t *testing.T) {
+	src := pom(`  <properties>
+    <base.b>2.12.0</base.b>
+  </properties>
+  <profiles>
+    <profile>
+      <id>a</id>
+      <properties>
+        <alias>${base.a}</alias>
+      </properties>
+    </profile>
+    <profile>
+      <id>b</id>
+      <properties>
+        <alias>${base.b}</alias>
+      </properties>
+    </profile>
+  </profiles>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${alias}</version>
+    </dependency>
+  </dependencies>`)
+
+	plan, out := run(t, map[string]string{"pom.xml": src}, jackson("2.15.4"))
+
+	if len(out) != 0 {
+		t.Errorf("must not resolve past an ambiguous hop:\n%v", out)
+	}
+	if len(plan.Skipped) != 1 || !strings.Contains(plan.Skipped[0].Reason, "more than one profile") {
+		t.Errorf("want an ambiguity refusal, got %+v", plan.Skipped)
+	}
+}
+
+// A retry after a partially applied pin must complete the missing roots, not
+// conclude from the first root's new entry that the work is done.
+func TestPinResumesAfterPartialApplication(t *testing.T) {
+	// root already carries the pin; standalone does not.
+	root := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.example</groupId>
+  <artifactId>root</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>com.fasterxml.jackson.core</groupId>
+        <artifactId>jackson-databind</artifactId>
+        <version>2.15.4</version>
+      </dependency>
+    </dependencies>
+  </dependencyManagement>
+  <modules>
+    <module>standalone</module>
+  </modules>
+</project>
+`
+	standalone := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.other</groupId>
+  <artifactId>standalone</artifactId>
+  <version>1.0.0</version>
+</project>
+`
+	req := jackson("2.15.4")
+	req.PinIfMissing = true
+	plan, out := run(t, map[string]string{
+		"pom.xml":            root,
+		"standalone/pom.xml": standalone,
+	}, req)
+
+	if plan.AlreadySatisfied {
+		t.Error("one root already pinned does not make the other satisfied")
+	}
+	if _, ok := out["standalone/pom.xml"]; !ok {
+		t.Fatalf("the uncovered root was not pinned; changed: %v", keysOf(out))
+	}
+	if _, ok := out["pom.xml"]; ok {
+		t.Error("the already-pinned root must not be touched again")
+	}
+}
+
+// Writing a range as the target leaves the declaration in a state the next
+// run refuses, so the repository can no longer be moved by this tool.
+func TestRangeTargetIsRejected(t *testing.T) {
+	proj, err := Load(writeRepo(t, map[string]string{"pom.xml": pom(`  <dependencies/>`)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"[2,3)", "[1.0]", "1.0,2.0"} {
+		if _, err := BumpProject(proj, Request{GroupID: "g", ArtifactID: "a", NewVersion: v}); err == nil {
+			t.Errorf("want rejection of range target %q", v)
+		}
+	}
+}
+
+// A character outside the XML 1.0 range survives a naive check and produces
+// a POM that no longer parses.
+func TestXMLIllegalCharacterIsRejected(t *testing.T) {
+	proj, err := Load(writeRepo(t, map[string]string{"pom.xml": pom(`  <dependencies/>`)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"1.0￾", "1.0￿", "1.0\u0001"} {
+		if _, err := BumpProject(proj, Request{GroupID: "g", ArtifactID: "a", NewVersion: v}); err == nil {
+			t.Errorf("want rejection of %q", v)
+		}
+	}
+}
+
+// A dependency reaching the edited property through an alias moves with it,
+// and a substring test on the version never sees the edited name.
+func TestSharedPropertyFollowsAliases(t *testing.T) {
+	src := pom(`  <properties>
+    <base>2.13.0</base>
+    <alias>${base}</alias>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${base}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>via-alias</artifactId>
+      <version>${alias}</version>
+    </dependency>
+  </dependencies>`)
+
+	plan, _ := run(t, map[string]string{"pom.xml": src}, jackson("2.15.4"))
+
+	if len(plan.SharedProperties) != 1 {
+		t.Fatalf("want a shared-property report, got %+v", plan.SharedProperties)
+	}
+	got := plan.SharedProperties[0].AlsoAffects
+	if len(got) != 1 || got[0] != "com.example:via-alias" {
+		t.Errorf("want the aliased artifact reported, got %v", got)
+	}
+}
+
 func keysOf(m map[string]string) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
