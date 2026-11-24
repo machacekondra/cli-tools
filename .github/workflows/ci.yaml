@@ -3,10 +3,14 @@ name: ci
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 permissions:
   contents: read
+
+env:
+  IMAGE: quay.io/project-lightpath/tssc-cli-tools
 
 jobs:
   build:
@@ -56,3 +60,111 @@ jobs:
 
       - name: Smoke test
         run: podman run --rm tssc-cli-tools:ci --version
+
+  # Publishing is a job of this workflow rather than a separate one so it can
+  # depend on the quality gate directly. A standalone workflow would either
+  # duplicate the gate -- free to drift out of step with it -- or chain off
+  # workflow_run, which runs against the default branch's definition and is
+  # easy to get subtly wrong.
+  publish:
+    runs-on: ubuntu-latest
+    needs: [build, image]
+    # Never on a pull request. Secrets are not exposed to fork PRs anyway, and
+    # code that has not been merged must not be able to push a release tag.
+    if: >-
+      github.event_name == 'push' &&
+      (github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v'))
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          # git describe needs the full history and tags; the default shallow
+          # fetch would silently degrade every version stamp to a bare hash.
+          fetch-depth: 0
+
+      - name: Check registry credentials are configured
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+        run: |
+          if [ -z "$QUAY_USERNAME" ] || [ -z "$QUAY_TOKEN" ]; then
+            echo "QUAY_USERNAME and QUAY_TOKEN must be set as organization secrets." >&2
+            echo "Without them podman login fails with an opaque error." >&2
+            exit 1
+          fi
+
+      - name: Compute tags
+        id: meta
+        run: |
+          set -euo pipefail
+          sha="$(git rev-parse --short HEAD)"
+          # Tags to publish. The immutable sha- tag always goes out so a
+          # TaskRun can pin an exact build; latest and the release tag are
+          # moving pointers layered on top of it.
+          tags="sha-${sha}"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            tags="${tags} latest"
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            tags="${tags} ${GITHUB_REF_NAME}"
+          fi
+          {
+            echo "sha=${sha}"
+            echo "version=$(git describe --tags --always)"
+            echo "tags=${tags}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build multi-arch image
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          SHA: ${{ steps.meta.outputs.sha }}
+        run: |
+          set -euo pipefail
+          # Both architectures cross-compile from the native builder, so this
+          # costs about as much as a single-arch build. See the
+          # --platform=$BUILDPLATFORM note in the Containerfile.
+          podman build \
+            --platform linux/amd64,linux/arm64 \
+            --manifest "${IMAGE}:${SHA}" \
+            --build-arg VERSION="${VERSION}" \
+            --build-arg COMMIT="${SHA}" \
+            --build-arg DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -f Containerfile .
+
+      - name: Log in to Quay
+        env:
+          QUAY_USERNAME: ${{ secrets.QUAY_USERNAME }}
+          QUAY_TOKEN: ${{ secrets.QUAY_TOKEN }}
+        run: echo "$QUAY_TOKEN" | podman login quay.io -u "$QUAY_USERNAME" --password-stdin
+
+      - name: Push
+        env:
+          SHA: ${{ steps.meta.outputs.sha }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          set -euo pipefail
+          for tag in $TAGS; do
+            echo "pushing ${IMAGE}:${tag}"
+            # --all pushes every architecture in the manifest list, not just
+            # the one matching the runner.
+            podman manifest push --all \
+              --digestfile /tmp/digest \
+              "${IMAGE}:${SHA}" "docker://${IMAGE}:${tag}"
+          done
+          {
+            echo "### Published \`${IMAGE}\`"
+            echo
+            echo "| field | value |"
+            echo "|---|---|"
+            echo "| digest | \`$(cat /tmp/digest)\` |"
+            echo "| tags | ${TAGS// /, } |"
+            echo "| arches | linux/amd64, linux/arm64 |"
+            echo
+            echo "Pin by digest in a Tekton Task:"
+            echo '```'
+            echo "image: ${IMAGE}@$(cat /tmp/digest)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Log out
+        if: always()
+        run: podman logout quay.io || true
