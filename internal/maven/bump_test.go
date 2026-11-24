@@ -3,6 +3,7 @@ package maven
 import (
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strings"
 	"testing"
@@ -1330,6 +1331,131 @@ func TestSharedPropertyFollowsAliases(t *testing.T) {
 	got := plan.SharedProperties[0].AlsoAffects
 	if len(got) != 1 || got[0] != "com.example:via-alias" {
 		t.Errorf("want the aliased artifact reported, got %v", got)
+	}
+}
+
+// A property expression as the target swaps a concrete version for an
+// indirection, which the next run then refuses because it does not resolve.
+func TestPropertyExpressionTargetIsRejected(t *testing.T) {
+	proj, err := Load(writeRepo(t, map[string]string{"pom.xml": pom(`  <dependencies/>`)}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, v := range []string{"${missing}", "${base}-tests", "1.0-${qualifier}"} {
+		if _, err := BumpProject(proj, Request{GroupID: "g", ArtifactID: "a", NewVersion: v}); err == nil {
+			t.Errorf("want rejection of target %q", v)
+		}
+	}
+}
+
+// With pinning off the caller has asked only for existing declarations to be
+// rewritten, so a root that does not declare the artifact is out of scope.
+// Treating it as uncovered made the command exit non-zero even though the
+// requested version was already in place everywhere it appears.
+func TestAlreadySatisfiedIgnoresUncoveredRootsWhenPinningIsOff(t *testing.T) {
+	root := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.example</groupId>
+  <artifactId>root</artifactId>
+  <version>1.0.0</version>
+  <packaging>pom</packaging>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>2.15.4</version>
+    </dependency>
+  </dependencies>
+  <modules>
+    <module>standalone</module>
+  </modules>
+</project>
+`
+	standalone := `<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0">
+  <groupId>com.other</groupId>
+  <artifactId>standalone</artifactId>
+  <version>1.0.0</version>
+</project>
+`
+	files := map[string]string{"pom.xml": root, "standalone/pom.xml": standalone}
+
+	t.Run("pinning off reports already satisfied", func(t *testing.T) {
+		req := jackson("2.15.4")
+		req.PinIfMissing = false
+		plan, out := run(t, files, req)
+
+		if !plan.AlreadySatisfied {
+			t.Error("want AlreadySatisfied so the caller does not treat this as a failure")
+		}
+		if len(out) != 0 || len(plan.Edits) != 0 {
+			t.Errorf("nothing should change: %v", keysOf(out))
+		}
+	})
+
+	t.Run("pinning on still fills the uncovered root", func(t *testing.T) {
+		req := jackson("2.15.4")
+		req.PinIfMissing = true
+		plan, out := run(t, files, req)
+
+		if plan.AlreadySatisfied {
+			t.Error("an uncovered root is not satisfied when pinning can fix it")
+		}
+		if _, ok := out["standalone/pom.xml"]; !ok {
+			t.Errorf("want the uncovered root pinned, changed: %v", keysOf(out))
+		}
+	})
+}
+
+// A composite expression whose placeholder is itself an alias is found by
+// neither a substring test for the edited property nor by resolving the whole
+// version as one reference.
+func TestSharedPropertyFollowsAliasInsideCompositeExpression(t *testing.T) {
+	src := pom(`  <properties>
+    <base>2.13.0</base>
+    <alias>${base}</alias>
+  </properties>
+  <dependencies>
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${base}</version>
+    </dependency>
+    <dependency>
+      <groupId>com.example</groupId>
+      <artifactId>composite-alias</artifactId>
+      <version>${alias}-tests</version>
+    </dependency>
+  </dependencies>`)
+
+	plan, _ := run(t, map[string]string{"pom.xml": src}, jackson("2.15.4"))
+
+	if len(plan.SharedProperties) != 1 {
+		t.Fatalf("want a shared-property report, got %+v", plan.SharedProperties)
+	}
+	got := plan.SharedProperties[0].AlsoAffects
+	if len(got) != 1 || got[0] != "com.example:composite-alias" {
+		t.Errorf("want the composite-alias artifact reported, got %v", got)
+	}
+}
+
+func TestPropertyRefsIn(t *testing.T) {
+	tests := []struct {
+		in   string
+		want []string
+	}{
+		{"2.13.0", nil},
+		{"${base}", []string{"base"}},
+		{"${base}-tests", []string{"base"}},
+		{"${major}.${minor}", []string{"major", "minor"}},
+		{"${ spaced }", []string{"spaced"}},
+		{"${unterminated", nil},
+		{"${}", nil},
+	}
+	for _, tc := range tests {
+		if got := propertyRefsIn(tc.in); !slices.Equal(got, tc.want) {
+			t.Errorf("propertyRefsIn(%q) = %v, want %v", tc.in, got, tc.want)
+		}
 	}
 }
 

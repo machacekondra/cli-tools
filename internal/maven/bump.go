@@ -48,6 +48,13 @@ func (r Request) validate() error {
 	if isRange(r.NewVersion) {
 		return fmt.Errorf("target version %q is a range; a fixed version is required", r.NewVersion)
 	}
+	// Writing a property expression as the target substitutes one
+	// indirection for a concrete version, and the next run then refuses the
+	// declaration because the property does not resolve. Whatever the
+	// expression was meant to mean, it is not a version.
+	if strings.Contains(r.NewVersion, "${") {
+		return fmt.Errorf("target version %q is a property expression; a literal version is required", r.NewVersion)
+	}
 	for _, f := range []struct{ name, value string }{
 		{"groupId", r.GroupID},
 		{"artifactId", r.ArtifactID},
@@ -233,7 +240,15 @@ func BumpProject(proj *Project, req Request) (*Plan, error) {
 		plan.Pinned = true
 	}
 
-	plan.AlreadySatisfied = len(covered) > 0 && len(uncovered) == 0 &&
+	// Every inheritance root has to be covered only when pinning is on,
+	// because only then can the missing ones be filled in. With pinning off
+	// the caller has said to rewrite existing declarations and nothing more,
+	// so a root that simply does not declare the artifact is out of scope --
+	// treating it as incomplete made the command exit non-zero even though
+	// the requested version was already in place everywhere it appears.
+	rootsCovered := !req.PinIfMissing || len(uncovered) == 0
+
+	plan.AlreadySatisfied = len(covered) > 0 && rootsCovered &&
 		len(plan.Edits) == 0 && len(plan.Skipped) == 0
 
 	sort.Slice(plan.Edits, func(i, j int) bool {
@@ -357,10 +372,25 @@ func checkDrift(req Request, found string) string {
 	return fmt.Sprintf("expected current version %q but found %q; refusing to overwrite", req.CurrentVersion, found)
 }
 
-// referencesProperty reports whether a version literal mentions ${name}
-// anywhere, including inside a larger expression.
-func referencesProperty(version, name string) bool {
-	return strings.Contains(version, "${"+name+"}")
+// propertyRefsIn returns the name of every ${...} placeholder in s, in order
+// of appearance. A version may hold several, as in "${major}.${minor}".
+func propertyRefsIn(s string) []string {
+	var names []string
+	for {
+		open := strings.Index(s, "${")
+		if open < 0 {
+			return names
+		}
+		s = s[open+2:]
+		close := strings.Index(s, "}")
+		if close < 0 {
+			return names
+		}
+		if name := strings.TrimSpace(s[:close]); name != "" {
+			names = append(names, name)
+		}
+		s = s[close+1:]
+	}
 }
 
 // isRange reports whether a Maven version is a range or hard requirement
@@ -380,28 +410,28 @@ func sharedProperty(proj *Project, t *target, req Request) *SharedProperty {
 			if decl.Coord() == req.Coord() || decl.Version == "" {
 				continue
 			}
-			// Two ways a declaration can move with this edit.
+			// Take every placeholder the version mentions, whether the
+			// version is exactly "${x}" or embeds it in something larger
+			// like "${x}-tests", and ask where each one ends up.
 			//
-			// Directly: its version mentions ${name} somewhere, including
-			// inside a larger expression like "${lib.version}-tests".
-			// Matching only exact "${name}" versions understated the radius.
-			if referencesProperty(decl.Version, t.property) {
+			// Both halves matter. A substring test alone misses a version
+			// that reaches the edited property through an alias; following
+			// the whole version as a chain alone misses composite
+			// expressions, which never parse as a single reference. Scanning
+			// the placeholders and resolving each one covers both, including
+			// the combination of the two.
+			for _, name := range propertyRefsIn(decl.Version) {
 				// The same property name in a different file may be a
-				// different property; only count it when it resolves here.
-				resolved, ok := proj.resolveProperty(pom, t.property)
-				if ok && resolved.Pom.Path == t.pom.Path && resolved.Span == t.span {
-					others[decl.Coord()] = true
+				// different property, so compare where it resolves rather
+				// than trusting the name.
+				resolved, ok := proj.resolveChain(pom, "${"+name+"}")
+				if !ok {
+					continue
 				}
-				continue
-			}
-
-			// Through an alias: the version is ${other}, and ${other} is
-			// itself defined as ${name}. A substring test never sees the
-			// edited property, so follow the chain and compare where it
-			// lands.
-			if resolved, ok := proj.resolveChain(pom, decl.Version); ok &&
-				resolved.Pom.Path == t.pom.Path && resolved.Span == t.span {
-				others[decl.Coord()] = true
+				if resolved.Pom.Path == t.pom.Path && resolved.Span == t.span {
+					others[decl.Coord()] = true
+					break
+				}
 			}
 		}
 	}
